@@ -604,6 +604,18 @@ if [[ "$INSTALL_MODE" == "true" ]]; then
     esac
   done
 
+  # Copy SQL dump and storage archive to install path so they survive temp cleanup
+  if [[ -n "$SQL_DUMP" && -f "$SQL_DUMP" ]]; then
+    cp "$SQL_DUMP" "${INSTALL_PATH}/$(basename "$SQL_DUMP")"
+    SQL_DUMP="${INSTALL_PATH}/$(basename "$SQL_DUMP")"
+    _log "Copied SQL dump to install path"
+  fi
+  if [[ -n "$STORAGE_ARCHIVE" && -f "$STORAGE_ARCHIVE" ]]; then
+    cp "$STORAGE_ARCHIVE" "${INSTALL_PATH}/$(basename "$STORAGE_ARCHIVE")"
+    STORAGE_ARCHIVE="${INSTALL_PATH}/$(basename "$STORAGE_ARCHIVE")"
+    _log "Copied storage archive to install path"
+  fi
+
   # Extract code archive
   if [[ -n "$CODE_ARCHIVE" ]]; then
     _nl
@@ -817,6 +829,10 @@ if [[ "$INSTALL_MODE" == "true" ]]; then
   else
     _info "No storage backup found in archive — storage starts empty."
   fi
+
+  # Clean up temp restore files from install path
+  [[ -n "$SQL_DUMP" && -f "$SQL_DUMP" && "$SQL_DUMP" == "${INSTALL_PATH}/"* ]] && rm -f "$SQL_DUMP"
+  [[ -n "$STORAGE_ARCHIVE" && -f "$STORAGE_ARCHIVE" && "$STORAGE_ARCHIVE" == "${INSTALL_PATH}/"* ]] && rm -f "$STORAGE_ARCHIVE"
 
   # ══════════════════════════════════════════════════════════════════════════
   # PHASE 8 — SSL CERTIFICATES
