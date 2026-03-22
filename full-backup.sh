@@ -271,7 +271,8 @@ if [[ "$INSTALL_MODE" == "true" ]]; then
   echo -e "  ${Y}⚠${N}  ${Y}Press Ctrl+C at any time to safely abort.${N}"
   echo -e "     ${D}You'll be asked if you want to clean up partial work.${N}"
   echo ""
-  read -rsp "  ${D}── press Enter to begin ──${N}" && echo ""
+  echo -en "  ${D}── press Enter to begin ──${N}"
+  read -rs && echo ""
 
   # ══════════════════════════════════════════════════════════════════════════
   # PHASE 0 — INITIALIZATION
@@ -337,6 +338,7 @@ if [[ "$INSTALL_MODE" == "true" ]]; then
   MISSING=()
 
   # Python
+  PY_NEEDS_UPGRADE=false
   if command -v python3 &>/dev/null; then
     PY_VER="$(python3 --version 2>&1 | awk '{print $2}')"
     PY_MAJ="${PY_VER%%.*}"
@@ -344,7 +346,8 @@ if [[ "$INSTALL_MODE" == "true" ]]; then
     if (( PY_MAJ >= 3 && PY_MIN >= 11 )); then
       _ok "python3     — ${G}${PY_VER}${N}  ≥3.11 ✓"
     else
-      _warn "python3     — ${Y}${PY_VER}${N}  (need ≥3.11)"
+      _warn "python3     — ${Y}${PY_VER}${N}  (need ≥3.11, will upgrade)"
+      PY_NEEDS_UPGRADE=true
       MISSING+=("python3")
     fi
   else
@@ -376,15 +379,20 @@ if [[ "$INSTALL_MODE" == "true" ]]; then
   fi
 
   # Docker
-  if command -v docker &>/dev/null && docker info &>/dev/null; then
-    _ok "docker      — ${G}$(docker --version | awk '{print $3}' | tr -d ,)${N}"
-  else
-    if command -v docker &>/dev/null; then
-      _warn "docker      — ${Y}installed but daemon not running${N}"
+  DOCKER_INSTALLED=false
+  DOCKER_RUNNING=false
+  if command -v docker &>/dev/null; then
+    DOCKER_INSTALLED=true
+    if docker info &>/dev/null 2>&1; then
+      DOCKER_RUNNING=true
+      _ok "docker      — ${G}$(docker --version | awk '{print $3}' | tr -d ,)${N}"
     else
-      _warn "docker      — ${Y}not found${N}"
+      _warn "docker      — ${Y}installed but daemon not running${N}"
+      MISSING+=("docker-start")  # needs starting, not installing
     fi
-    MISSING+=("docker")
+  else
+    _warn "docker      — ${Y}not found${N}"
+    MISSING+=("docker-install")  # needs installing
   fi
 
   # git
@@ -409,7 +417,28 @@ if [[ "$INSTALL_MODE" == "true" ]]; then
     _nl
     for pkg in "${MISSING[@]}"; do
       case "$pkg" in
-        docker)
+        docker-start)
+          echo -e "  ${C}── Docker ──${N}"
+          _info "Docker is installed but the daemon is not running."
+          _nl
+          _ask "Attempt to start Docker now? [Y/n]: "
+          read -r _ds
+          if [[ "${_ds:-Y}" =~ ^[Yy] ]]; then
+            case "$INST_OS" in
+              macOS) open -a Docker 2>/dev/null; _info "Starting Docker Desktop (this may take a minute)..."; sleep 15 ;;
+              Linux) sudo systemctl start docker 2>&1 | tail -3 ;;
+            esac
+            if docker info &>/dev/null 2>&1; then
+              DOCKER_RUNNING=true
+              _ok "Docker daemon is now running"
+            else
+              _warn "Docker daemon may still be starting. Will retry later."
+            fi
+          else
+            _warn "Docker not started — Supabase will not be available until Docker is running"
+          fi
+          _nl ;;
+        docker-install)
           echo -e "  ${C}── Docker ──${N}"
           _info "Docker is required to run Supabase (auth, database, storage)."
           case "$INST_OS" in
@@ -425,7 +454,9 @@ if [[ "$INSTALL_MODE" == "true" ]]; then
               macOS) brew install --cask docker 2>&1 | tail -3; open -a Docker; _info "Waiting for Docker to start (this may take a minute)..."; sleep 15 ;;
               Linux) sudo apt-get install -y docker.io docker-compose-plugin 2>&1 | tail -3; sudo systemctl start docker ;;
             esac
-            if docker info &>/dev/null; then
+            if docker info &>/dev/null 2>&1; then
+              DOCKER_INSTALLED=true
+              DOCKER_RUNNING=true
               _ok "Docker installed and running"
             else
               _warn "Docker installed but daemon may still be starting. Continuing..."
@@ -455,18 +486,64 @@ if [[ "$INSTALL_MODE" == "true" ]]; then
           fi
           _nl ;;
         python3)
-          _warn "Python ≥3.11 is required. Install:"
+          if [[ "$PY_NEEDS_UPGRADE" == "true" ]]; then
+            echo -e "  ${C}── Python Upgrade ──${N}"
+            _info "Python ${PY_VER} is installed but the app requires ≥3.11."
+          else
+            echo -e "  ${C}── Python ──${N}"
+            _info "Python is not installed."
+          fi
           case "$INST_OS" in
-            macOS) _dim "  brew install python@3.12" ;;
-            Linux) _dim "  sudo apt install python3.12 python3.12-venv" ;;
+            macOS) _dim "  Install: brew install python@3.12" ;;
+            Linux) _dim "  Install: sudo apt install python3.12 python3.12-venv" ;;
           esac
+          _nl
+          _ask "Install/upgrade Python now? [Y/n]: "
+          read -r _py
+          if [[ "${_py:-Y}" =~ ^[Yy] ]]; then
+            case "$INST_OS" in
+              macOS) brew install python@3.12 2>&1 | tail -5 ;;
+              Linux) sudo apt-get install -y python3.12 python3.12-venv 2>&1 | tail -5 ;;
+            esac
+            # Check if the new version is available
+            if command -v python3.12 &>/dev/null; then
+              _ok "Python 3.12 installed — will use python3.12 for venv"
+              PY_CMD="python3.12"
+            elif python3 --version 2>&1 | awk '{print $2}' | grep -qE '^3\.1[1-9]'; then
+              _ok "Python upgraded successfully"
+              PY_CMD="python3"
+            else
+              _warn "Python may have installed to a different path. Check: python3.12 --version"
+              PY_CMD="python3"
+            fi
+          else
+            _warn "Python not upgraded — venv may fail. See md-files/service_setup.md"
+            PY_CMD="python3"
+          fi
           _nl ;;
         node)
-          _warn "Node.js ≥20 is required. Install:"
+          echo -e "  ${C}── Node.js ──${N}"
+          _info "Node.js ≥20 is required for the frontend build."
           case "$INST_OS" in
-            macOS) _dim "  brew install node@20" ;;
-            Linux) _dim "  curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash - && sudo apt install -y nodejs" ;;
+            macOS) _dim "  Install: brew install node@20" ;;
+            Linux) _dim "  Install via NodeSource" ;;
           esac
+          _nl
+          _ask "Install Node.js now? [Y/n]: "
+          read -r _nd
+          if [[ "${_nd:-Y}" =~ ^[Yy] ]]; then
+            case "$INST_OS" in
+              macOS) brew install node@20 2>&1 | tail -5 ;;
+              Linux) curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash - 2>&1 | tail -3; sudo apt-get install -y nodejs 2>&1 | tail -3 ;;
+            esac
+            if command -v node &>/dev/null; then
+              _ok "Node.js $(node --version) installed"
+            else
+              _warn "Node.js installed but may need a new shell. Continuing..."
+            fi
+          else
+            _warn "Node.js not installed — frontend build will fail. See md-files/service_setup.md"
+          fi
           _nl ;;
         npm)
           _warn "npm is required (usually comes with Node.js)."
@@ -555,9 +632,11 @@ if [[ "$INSTALL_MODE" == "true" ]]; then
   # ══════════════════════════════════════════════════════════════════════════
   _head "Phase 3 · Python Virtual Environment"
   _nl
-  if command -v python3 &>/dev/null; then
+  PY_CMD="${PY_CMD:-python3}"
+  if command -v "$PY_CMD" &>/dev/null; then
+    _info "Using: $PY_CMD ($($PY_CMD --version 2>&1))"
     _info "Creating venv: .venv"
-    python3 -m venv .venv 2>&1 | tail -3
+    "$PY_CMD" -m venv .venv 2>&1 | tail -3
     _ok "Virtual environment created"
     _info "Installing Python dependencies..."
     .venv/bin/pip install --upgrade pip -q 2>&1 | tail -1
@@ -578,7 +657,7 @@ if [[ "$INSTALL_MODE" == "true" ]]; then
       fi
     done
   else
-    _warn "python3 not available — skipping venv creation"
+    _warn "${PY_CMD} not available — skipping venv creation"
     _dim "  Install Python ≥3.11 and re-run --install"
   fi
 
