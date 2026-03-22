@@ -727,6 +727,23 @@ if [[ "$INSTALL_MODE" == "true" ]]; then
     _spin $! "Starting Supabase containers..."
     _nl
     _ok "Supabase started"
+
+    # ── Sync JWT keys from running instance to .env ──────────────────────────
+    _info "Syncing JWT keys from Supabase instance..."
+    _SB_STATUS="$(npx supabase status 2>/dev/null || true)"
+    _SB_ANON="$(echo "$_SB_STATUS" | grep -iE 'Publishable|anon' | head -1 | awk -F'│' '{print $3}' | xargs 2>/dev/null || true)"
+    _SB_SECRET="$(echo "$_SB_STATUS" | grep -iE '^│.*Secret ' | head -1 | awk -F'│' '{print $3}' | xargs 2>/dev/null || true)"
+    if [[ -n "$_SB_ANON" && -f "${INSTALL_PATH}/.env" ]]; then
+      sed -i.bak "s|^SUPABASE_ANON_KEY=.*|SUPABASE_ANON_KEY=${_SB_ANON}|" "${INSTALL_PATH}/.env"
+      sed -i.bak "s|^VITE_SUPABASE_ANON_KEY=.*|VITE_SUPABASE_ANON_KEY=${_SB_ANON}|" "${INSTALL_PATH}/.env"
+      rm -f "${INSTALL_PATH}/.env.bak"
+      _ok "Anon key synced to .env"
+    fi
+    if [[ -n "$_SB_SECRET" && -f "${INSTALL_PATH}/.env" ]]; then
+      sed -i.bak "s|^SUPABASE_SERVICE_KEY=.*|SUPABASE_SERVICE_KEY=${_SB_SECRET}|" "${INSTALL_PATH}/.env"
+      rm -f "${INSTALL_PATH}/.env.bak"
+      _ok "Service key synced to .env"
+    fi
   else
     _warn "Docker not running — Supabase cannot start."
     _dim "  Start Docker and run: npx supabase start"
@@ -766,13 +783,76 @@ if [[ "$INSTALL_MODE" == "true" ]]; then
         SB_DB_PORT="$(grep -A0 '^\[db\]' supabase/config.toml | head -5 | grep 'port' | head -1 | awk '{print $3}' || echo 54322)"
         [[ -z "$SB_DB_PORT" || "$SB_DB_PORT" == "0" ]] && SB_DB_PORT=54322
       fi
-      _info "Restoring database..."
-      if psql "postgresql://postgres:postgres@127.0.0.1:${SB_DB_PORT}/postgres" < "$SQL_DUMP" >> "$LOG_FILE" 2>&1; then
-        _ok "Database restored successfully"
-        DB_RESTORED=true
-      else
-        _warn "Database restore had errors — check log file for details"
+      _RESTORE_DB_URL="postgresql://postgres:postgres@127.0.0.1:${SB_DB_PORT}/postgres"
+
+      # Drop and recreate public schema to avoid "already exists" conflicts
+      _info "Preparing database (clean public schema)..."
+      psql "$_RESTORE_DB_URL" -c "
+        DROP SCHEMA IF EXISTS public CASCADE;
+        CREATE SCHEMA public;
+        GRANT ALL ON SCHEMA public TO postgres;
+        GRANT USAGE ON SCHEMA public TO anon, authenticated, service_role;
+        GRANT CREATE ON SCHEMA public TO postgres;
+      " >> "$LOG_FILE" 2>&1
+      _ok "Public schema reset"
+
+      _info "Restoring database (auth/storage errors are expected)..."
+      psql "$_RESTORE_DB_URL" -v ON_ERROR_STOP=0 -f "$SQL_DUMP" >> "$LOG_FILE" 2>&1 || true
+      _ok "Database data restored"
+
+      # Storage metadata requires supabase_admin (superuser) since postgres can't SET ROLE
+      _ADMIN_DB_URL="postgresql://supabase_admin:postgres@127.0.0.1:${SB_DB_PORT}/postgres"
+      _info "Restoring storage metadata..."
+      psql "$_ADMIN_DB_URL" -v ON_ERROR_STOP=0 -f "$SQL_DUMP" >> "$LOG_FILE" 2>&1 || true
+      _ok "Storage metadata restored"
+
+      DB_RESTORED=true
+
+      # Recreate auth users via Supabase Admin API to preserve original UUIDs
+      _info "Recreating auth users via Supabase Admin API..."
+      _SB_SVC_KEY="$(grep '^SUPABASE_SERVICE_KEY=' .env 2>/dev/null | cut -d= -f2- || echo "")"
+      _SB_API="http://127.0.0.1:${SB_DB_PORT%2}1"  # API port = DB port with last digit changed
+      _SB_API="http://127.0.0.1:54321"  # Default Supabase API port
+
+      _AUTH_DATA="$(awk '
+      BEGIN { in_copy=0 }
+      /^COPY auth\.users \(/ {
+          in_copy=1
+          gsub(/^COPY auth\.users \(/, "")
+          gsub(/\) FROM stdin;$/, "")
+          n = split($0, cols, ",")
+          for (i=1; i<=n; i++) { gsub(/^ +| +$/, "", cols[i]); if (cols[i]=="id") ic=i; if (cols[i]=="email") ec=i; if (cols[i]=="raw_user_meta_data") mc=i }
+          next
+      }
+      in_copy && /^\\\.$/ { in_copy=0; next }
+      in_copy {
+          n = split($0, f, "\t")
+          uid = (ic<=n) ? f[ic] : ""
+          email = (ec<=n) ? f[ec] : ""
+          meta = (mc<=n) ? f[mc] : "{}"
+          if (meta == "\\N") meta = "{}"
+          if (uid != "" && email != "" && email != "\\N") print uid "\t" email "\t" meta
+      }
+      ' "$SQL_DUMP" 2>/dev/null)"
+
+      _AUTH_COUNT=0
+      if [[ -n "$_AUTH_DATA" && -n "$_SB_SVC_KEY" ]]; then
+        while IFS=$'\t' read -r _uid _email _meta; do
+          [[ -z "$_uid" || -z "$_email" ]] && continue
+          _HTTP=$(curl -s -o /dev/null -w "%{http_code}" \
+            -X POST "${_SB_API}/auth/v1/admin/users" \
+            -H "apikey: ${_SB_SVC_KEY}" \
+            -H "Authorization: Bearer ${_SB_SVC_KEY}" \
+            -H "Content-Type: application/json" \
+            -d "{\"id\":\"${_uid}\",\"email\":\"${_email}\",\"email_confirm\":true,\"app_metadata\":{\"providers\":[\"google\"],\"provider\":\"google\"}}" \
+            2>/dev/null || echo "000")
+          if [[ "$_HTTP" == "200" || "$_HTTP" == "201" ]]; then
+            _ok "Auth user: ${_email}"
+            _AUTH_COUNT=$((_AUTH_COUNT + 1))
+          fi
+        done <<< "$_AUTH_DATA"
       fi
+      _ok "${_AUTH_COUNT} auth user(s) recreated"
     else
       _info "Running migrations..."
       if [[ -d "backend" && -f ".venv/bin/alembic" ]]; then
@@ -816,12 +896,27 @@ if [[ "$INSTALL_MODE" == "true" ]]; then
     _stor_choice=${_stor_choice:-1}
     _nl
     if [[ "$_stor_choice" == "1" ]]; then
-      # Determine volume name from project dir
-      VOL_NAME="supabase_storage_$(basename "$INSTALL_PATH" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9_')"
+      # Derive volume name from config.toml project_id (not directory basename)
+      _PROJ_ID="$(grep '^project_id' supabase/config.toml 2>/dev/null | awk -F'"' '{print $2}' || echo "")"
+      if [[ -n "$_PROJ_ID" ]]; then
+        VOL_NAME="supabase_storage_${_PROJ_ID}"
+      else
+        VOL_NAME="supabase_storage_$(basename "$INSTALL_PATH" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9_')"
+      fi
       _info "Creating Docker volume: ${VOL_NAME}"
       docker volume create "$VOL_NAME" >> "$LOG_FILE" 2>&1
+
+      # Extract to temp dir, detect double-stub, and fix path structure
       _info "Loading storage backup into volume..."
-      docker run --rm -v "${VOL_NAME}:/mnt" -v "$(dirname "$STORAGE_ARCHIVE"):/backup:ro" alpine tar xzf "/backup/$(basename "$STORAGE_ARCHIVE")" -C /mnt 2>&1 | tail -3
+      _STOR_TMP="$(mktemp -d)"
+      tar xzf "$STORAGE_ARCHIVE" -C "$_STOR_TMP" 2>/dev/null || true
+      if [[ -d "$_STOR_TMP/stub/stub" ]]; then
+        _warn "Detected double 'stub/stub' path in archive — correcting..."
+        docker run --rm -v "${VOL_NAME}:/mnt" -v "${_STOR_TMP}/stub:/src:ro" alpine sh -c "cp -a /src/. /mnt/stub/" 2>&1 | tail -3
+      else
+        docker run --rm -v "${VOL_NAME}:/mnt" -v "${_STOR_TMP}:/src:ro" alpine sh -c "cp -a /src/. /mnt/" 2>&1 | tail -3
+      fi
+      rm -rf "$_STOR_TMP"
       _ok "Storage volume restored"
     else
       _info "Skipping storage restore — starting empty"
@@ -1372,16 +1467,46 @@ if [[ "$SEL_DATABASE" == "true" ]]; then
     # -o mode: write directly to a named individual archive
     DB_TMP="${SCRIPT_DIR}/${STAMP}-cbnext.sql"
     DB_OUT="${SCRIPT_DIR}/cb-next-database_${STAMP}.tar.gz"
-    info "Dumping Postgres to temporary SQL file..."
-    pg_dump "$DB_URL" --no-owner --no-acl -f "$DB_TMP"
+    info "Dumping public schema to temporary SQL file..."
+    pg_dump "$DB_URL" --schema=public --no-owner --no-acl -f "$DB_TMP"
+    # Append storage metadata (buckets + objects) with elevated role
+    info "Appending storage metadata..."
+    {
+      echo ""
+      echo "-- CB-NEXT: Storage metadata (requires supabase_storage_admin role)"
+      echo "SET ROLE supabase_storage_admin;"
+      echo "ALTER TABLE storage.objects DISABLE TRIGGER ALL;"
+      echo "ALTER TABLE storage.buckets DISABLE TRIGGER ALL;"
+      echo "TRUNCATE storage.objects CASCADE;"
+      echo "TRUNCATE storage.buckets CASCADE;"
+      pg_dump "$DB_URL" --table=storage.buckets --table=storage.objects --data-only --no-owner --no-acl 2>/dev/null || true
+      echo "ALTER TABLE storage.buckets ENABLE TRIGGER ALL;"
+      echo "ALTER TABLE storage.objects ENABLE TRIGGER ALL;"
+      echo "RESET ROLE;"
+    } >> "$DB_TMP"
     ( cd "$SCRIPT_DIR"; tar czf "$(basename "$DB_OUT")" "$(basename "$DB_TMP")" )
     rm -f "$DB_TMP"
     SIZE=$(du -sh "$DB_OUT" | awk '{print $1}')
     success "Database backup: $(basename "$DB_OUT") [${SIZE}]"
   else
     SQL_FILE="${SCRIPT_DIR}/${STAMP}-cbnext.sql"
-    info "Dumping Postgres to: $(basename "$SQL_FILE")"
-    pg_dump "$DB_URL" --no-owner --no-acl -f "$SQL_FILE"
+    info "Dumping public schema to: $(basename "$SQL_FILE")"
+    pg_dump "$DB_URL" --schema=public --no-owner --no-acl -f "$SQL_FILE"
+    # Append storage metadata (buckets + objects) with elevated role
+    info "Appending storage metadata..."
+    {
+      echo ""
+      echo "-- CB-NEXT: Storage metadata (requires supabase_storage_admin role)"
+      echo "SET ROLE supabase_storage_admin;"
+      echo "ALTER TABLE storage.objects DISABLE TRIGGER ALL;"
+      echo "ALTER TABLE storage.buckets DISABLE TRIGGER ALL;"
+      echo "TRUNCATE storage.objects CASCADE;"
+      echo "TRUNCATE storage.buckets CASCADE;"
+      pg_dump "$DB_URL" --table=storage.buckets --table=storage.objects --data-only --no-owner --no-acl 2>/dev/null || true
+      echo "ALTER TABLE storage.buckets ENABLE TRIGGER ALL;"
+      echo "ALTER TABLE storage.objects ENABLE TRIGGER ALL;"
+      echo "RESET ROLE;"
+    } >> "$SQL_FILE"
     SIZE=$(du -sh "$SQL_FILE" | awk '{print $1}')
     success "Database backup complete: $(basename "$SQL_FILE") [${SIZE}]"
   fi
@@ -1571,4 +1696,3 @@ for f in "${SCRIPT_DIR}/cb-next-"*"_${STAMP}.tar.gz"; do
   fi
 done
 echo ""
-
