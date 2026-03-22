@@ -101,6 +101,19 @@ _ask()  { echo -en "  ${W}?${N} $*"; }
 _dim()  { echo -e "  ${D}$*${N}"; }
 _nl()   { echo ""; }
 
+# Spinner for background tasks: _spin <pid> <message>
+_spin() {
+  local pid=$1 msg="$2"
+  local frames='⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
+  local i=0
+  while kill -0 "$pid" 2>/dev/null; do
+    printf "\r  ${B}%s${N} %s" "${frames:i%10:1}" "$msg"
+    i=$((i + 1))
+    sleep 0.1
+  done
+  printf "\r%*s\r" $((${#msg} + 6)) ""  # clear line
+}
+
 # ── Logging ───────────────────────────────────────────────────────────────────
 INSTALL_PATH=""
 ARCHIVE_BASE=""
@@ -425,7 +438,12 @@ if [[ "$INSTALL_MODE" == "true" ]]; then
           read -r _ds
           if [[ "${_ds:-Y}" =~ ^[Yy] ]]; then
             case "$INST_OS" in
-              macOS) open -a Docker 2>/dev/null; _info "Starting Docker Desktop (this may take a minute)..."; sleep 15 ;;
+              macOS)
+                open -a Docker 2>/dev/null
+                # Wait for Docker with spinner
+                ( while ! docker info &>/dev/null 2>&1; do sleep 1; done ) &
+                _spin $! "Starting Docker Desktop..."
+                ;;
               Linux) sudo systemctl start docker 2>&1 | tail -3 ;;
             esac
             if docker info &>/dev/null 2>&1; then
@@ -639,12 +657,16 @@ if [[ "$INSTALL_MODE" == "true" ]]; then
     "$PY_CMD" -m venv .venv 2>&1 | tail -3
     _ok "Virtual environment created"
     _info "Installing Python dependencies..."
-    .venv/bin/pip install --upgrade pip -q 2>&1 | tail -1
+    .venv/bin/pip install --upgrade pip -q >> "$LOG_FILE" 2>&1 &
+    _spin $! "Upgrading pip..."
+    _ok "pip upgraded"
     if [[ -f "requirements.txt" ]]; then
-      .venv/bin/pip install -r requirements.txt -q 2>&1 | tail -5
+      .venv/bin/pip install -r requirements.txt -q >> "$LOG_FILE" 2>&1 &
+      _spin $! "Installing requirements.txt..."
     fi
     if [[ -f "backend/requirements.txt" ]]; then
-      .venv/bin/pip install -r backend/requirements.txt -q 2>&1 | tail -5
+      .venv/bin/pip install -r backend/requirements.txt -q >> "$LOG_FILE" 2>&1 &
+      _spin $! "Installing backend/requirements.txt..."
     fi
     _ok "Python dependencies installed"
     # Verify
@@ -668,7 +690,8 @@ if [[ "$INSTALL_MODE" == "true" ]]; then
   _nl
   if command -v npm &>/dev/null && [[ -d "frontend" ]]; then
     _info "Running: npm install in frontend/"
-    (cd frontend && npm install 2>&1 | tail -5)
+    (cd frontend && npm install >> "$LOG_FILE" 2>&1) &
+    _spin $! "Installing node modules..."
     if [[ -d "frontend/node_modules" ]]; then
       _ok "node_modules/ created"
     else
@@ -688,9 +711,8 @@ if [[ "$INSTALL_MODE" == "true" ]]; then
     _nl
     _info "Starting Supabase local stack..."
     _info "Running: npx supabase start (this may take a few minutes on first run)"
-    npx -y supabase start 2>&1 | tee -a "$LOG_FILE" | grep -E '(Started|API URL|anon key|service_role|DB URL|Studio)' | while IFS= read -r line; do
-      _dim "  $line"
-    done
+    npx -y supabase start >> "$LOG_FILE" 2>&1 &
+    _spin $! "Starting Supabase containers..."
     _nl
     _ok "Supabase started"
   else
@@ -868,18 +890,21 @@ if [[ "$INSTALL_MODE" == "true" ]]; then
   _nl
   _info "Checking default ports..."
 
-  declare -A PORT_MAP=(
-    [443]="HTTPS proxy"
-    [5173]="Vite frontend"
-    [8000]="Backend API"
-    [54321]="Supabase API"
-    [54322]="Supabase DB"
-    [54323]="Supabase Studio"
-  )
+  _port_label() {
+    case "$1" in
+      443)   echo "HTTPS proxy" ;;
+      5173)  echo "Vite frontend" ;;
+      8000)  echo "Backend API" ;;
+      54321) echo "Supabase API" ;;
+      54322) echo "Supabase DB" ;;
+      54323) echo "Supabase Studio" ;;
+      *)     echo "unknown" ;;
+    esac
+  }
 
   PORTS_CHANGED=false
   for port in 443 5173 8000 54321 54322 54323; do
-    label="${PORT_MAP[$port]}"
+    label="$(_port_label "$port")"
     if _port_free "$port"; then
       _ok "${port}  (${label}) — ${G}available${N}"
     else
