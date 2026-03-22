@@ -61,11 +61,11 @@ while [[ $i -le $# ]]; do
     -o|--options) OPTIONS_MODE=true ;;
     --me)         ME_FLAG=true ;;
     --retry)      RETRY_MODE=true ;;
-    --install)
-      INSTALL_MODE=true
-      i=$((i + 1))
-      if [[ $i -le $# ]]; then
-        INSTALL_ARCHIVE="${!i}"
+    --install)    INSTALL_MODE=true ;;
+    -*)           ;; # ignore unknown flags
+    *)            # positional arg → treat as archive path
+      if [[ -z "$INSTALL_ARCHIVE" ]]; then
+        INSTALL_ARCHIVE="$arg"
       fi
       ;;
   esac
