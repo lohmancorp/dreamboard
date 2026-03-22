@@ -896,28 +896,58 @@ if [[ "$INSTALL_MODE" == "true" ]]; then
     _stor_choice=${_stor_choice:-1}
     _nl
     if [[ "$_stor_choice" == "1" ]]; then
-      # Derive volume name from config.toml project_id (not directory basename)
-      _PROJ_ID="$(grep '^project_id' supabase/config.toml 2>/dev/null | awk -F'"' '{print $2}' || echo "")"
-      if [[ -n "$_PROJ_ID" ]]; then
-        VOL_NAME="supabase_storage_${_PROJ_ID}"
-      else
-        VOL_NAME="supabase_storage_$(basename "$INSTALL_PATH" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9_')"
-      fi
-      _info "Creating Docker volume: ${VOL_NAME}"
-      docker volume create "$VOL_NAME" >> "$LOG_FILE" 2>&1
-
-      # Extract to temp dir, detect double-stub, and fix path structure
-      _info "Loading storage backup into volume..."
+      _info "Extracting storage archive..."
       _STOR_TMP="$(mktemp -d)"
       tar xzf "$STORAGE_ARCHIVE" -C "$_STOR_TMP" 2>/dev/null || true
-      if [[ -d "$_STOR_TMP/stub/stub" ]]; then
-        _warn "Detected double 'stub/stub' path in archive — correcting..."
-        docker run --rm -v "${VOL_NAME}:/mnt" -v "${_STOR_TMP}/stub:/src:ro" alpine sh -c "cp -a /src/. /mnt/stub/" 2>&1 | tail -3
-      else
-        docker run --rm -v "${VOL_NAME}:/mnt" -v "${_STOR_TMP}:/src:ro" alpine sh -c "cp -a /src/. /mnt/" 2>&1 | tail -3
-      fi
+
+      # Normalise double-stub path (./stub/stub/... → use inner stub)
+      _STOR_ROOT="$_STOR_TMP/stub"
+      [[ -d "$_STOR_TMP/stub/stub" ]] && _STOR_ROOT="$_STOR_TMP/stub/stub"
+
+      # Get service key for API calls
+      _SB_SVC_KEY="$(grep '^SUPABASE_SERVICE_KEY=' .env 2>/dev/null | cut -d= -f2- || echo "")"
+      _SB_API="http://127.0.0.1:54321"
+
+      _info "Uploading storage files via Supabase API..."
+      _TOTAL_UPLOADED=0
+      for _bdir in "$_STOR_ROOT"/*/; do
+        [[ ! -d "$_bdir" ]] && continue
+        _bucket="$(basename "$_bdir")"
+
+        # Create bucket (ignore 409 = already exists)
+        curl -s -o /dev/null -X POST "${_SB_API}/storage/v1/bucket" \
+          -H "apikey: ${_SB_SVC_KEY}" \
+          -H "Authorization: Bearer ${_SB_SVC_KEY}" \
+          -H "Content-Type: application/json" \
+          -d "{\"id\":\"${_bucket}\",\"name\":\"${_bucket}\",\"public\":true}" 2>/dev/null || true
+
+        # Upload each file via API (sets xattrs + metadata automatically)
+        _bcount=0
+        while IFS= read -r _fpath; do
+          _relpath="${_fpath#${_bdir}}"
+          _obj_path="${_relpath%/*}"   # everything except version UUID
+          case "$_obj_path" in
+            *.jpg|*.jpeg) _mime="image/jpeg" ;;
+            *.png)        _mime="image/png" ;;
+            *.webp)       _mime="image/webp" ;;
+            *.ico)        _mime="image/vnd.microsoft.icon" ;;
+            *.svg)        _mime="image/svg+xml" ;;
+            *.gif)        _mime="image/gif" ;;
+            *)            _mime="application/octet-stream" ;;
+          esac
+          curl -s -o /dev/null -X POST "${_SB_API}/storage/v1/object/${_bucket}/${_obj_path}" \
+            -H "apikey: ${_SB_SVC_KEY}" \
+            -H "Authorization: Bearer ${_SB_SVC_KEY}" \
+            -H "Content-Type: ${_mime}" \
+            -H "x-upsert: true" \
+            --data-binary "@${_fpath}" 2>/dev/null || true
+          _bcount=$((_bcount + 1))
+        done < <(find "$_bdir" -type f)
+        _TOTAL_UPLOADED=$((_TOTAL_UPLOADED + _bcount))
+        _ok "Bucket '${_bucket}': ${_bcount} file(s) uploaded"
+      done
       rm -rf "$_STOR_TMP"
-      _ok "Storage volume restored"
+      _ok "Storage restored: ${_TOTAL_UPLOADED} total file(s) via API"
     else
       _info "Skipping storage restore — starting empty"
     fi
@@ -1696,3 +1726,4 @@ for f in "${SCRIPT_DIR}/cb-next-"*"_${STAMP}.tar.gz"; do
   fi
 done
 echo ""
+
