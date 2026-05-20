@@ -34,14 +34,30 @@
 set -euo pipefail
 
 # ── Configuration ─────────────────────────────────────────────────────────────
-DB_URL="${DB_URL:-postgresql://postgres:postgres@127.0.0.1:54322/postgres}"
-STORAGE_VOLUME="${STORAGE_VOLUME:-supabase_storage_taylor}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="${PROJECT_ROOT:-$(dirname "$SCRIPT_DIR")}"
 SUPABASE_CONFIG="${SUPABASE_CONFIG:-${PROJECT_ROOT}/supabase/config.toml}"
 ENV_FILE="${ENV_FILE:-${PROJECT_ROOT}/.env}"
 KEEP_BACKUPS="${KEEP_BACKUPS:-7}"
 STAMP="$(date +'%Y-%m-%d_%H-%M')"
+
+# Detect Supabase project_id from config.toml so we never hardcode "taylor".
+# Override at the env level with PROJECT_ID=<name> if needed.
+_detect_project_id() {
+  local cfg="${1:-$SUPABASE_CONFIG}"
+  if [[ -f "$cfg" ]]; then
+    awk -F'=' '/^[[:space:]]*project_id[[:space:]]*=/ {
+      gsub(/[[:space:]"]+/, "", $2); print $2; exit
+    }' "$cfg"
+  fi
+}
+PROJECT_ID="${PROJECT_ID:-$(_detect_project_id || true)}"
+PROJECT_ID="${PROJECT_ID:-taylor}"
+
+DB_URL="${DB_URL:-postgresql://postgres:postgres@127.0.0.1:54322/postgres}"
+STORAGE_VOLUME="${STORAGE_VOLUME:-supabase_storage_${PROJECT_ID}}"
+DB_VOLUME="${DB_VOLUME:-supabase_db_${PROJECT_ID}}"
+REDIS_VOLUME="${REDIS_VOLUME:-cb-next_redisdata}"
 
 # ── Flag Parsing ──────────────────────────────────────────────────────────────
 SKIP_CODE=false
@@ -51,19 +67,34 @@ INSTALL_MODE=false
 INSTALL_ARCHIVE=""
 ME_FLAG=false
 RETRY_MODE=false
+TEST_RESTORE_MODE=false
+TEST_KEEP=false
+TEST_ARCHIVE=""
+PREREQS_ONLY=false
+SKIP_PREREQS=false
+DRY_RUN=false
 
 i=1
 while [[ $i -le $# ]]; do
   arg="${!i}"
   case "$arg" in
-    --no-code)    SKIP_CODE=true ;;
-    --db-only)    DB_ONLY=true; SKIP_CODE=true ;;
-    -o|--options) OPTIONS_MODE=true ;;
-    --me)         ME_FLAG=true ;;
-    --retry)      RETRY_MODE=true ;;
-    --install)    INSTALL_MODE=true ;;
-    -*)           ;; # ignore unknown flags
-    *)            # positional arg → treat as archive path
+    --no-code)        SKIP_CODE=true ;;
+    --db-only)        DB_ONLY=true; SKIP_CODE=true ;;
+    -o|--options)     OPTIONS_MODE=true ;;
+    --me)             ME_FLAG=true ;;
+    --retry)          RETRY_MODE=true ;;
+    --install)        INSTALL_MODE=true ;;
+    --test-restore)   TEST_RESTORE_MODE=true ;;
+    --keep)           TEST_KEEP=true ;;
+    --archive)        i=$((i + 1)); TEST_ARCHIVE="${!i:-}" ;;
+    --prereqs-only)   PREREQS_ONLY=true ;;
+    --skip-prereqs)   SKIP_PREREQS=true ;;
+    --dry-run)        DRY_RUN=true ;;
+    --project-id)     i=$((i + 1)); PROJECT_ID="${!i:-$PROJECT_ID}"
+                      STORAGE_VOLUME="supabase_storage_${PROJECT_ID}"
+                      DB_VOLUME="supabase_db_${PROJECT_ID}" ;;
+    -*)               ;; # ignore unknown flags
+    *)                # positional arg → treat as archive path
       if [[ -z "$INSTALL_ARCHIVE" ]]; then
         INSTALL_ARCHIVE="$arg"
       fi
@@ -71,6 +102,106 @@ while [[ $i -le $# ]]; do
   esac
   i=$((i + 1))
 done
+
+# ── Shared helpers (used by both backup and restore paths) ───────────────────
+
+_sha256() {
+  if command -v shasum &>/dev/null; then
+    shasum -a 256 "$1" | awk '{print $1}'
+  elif command -v sha256sum &>/dev/null; then
+    sha256sum "$1" | awk '{print $1}'
+  else
+    echo ""
+  fi
+}
+
+_supabase_cli_version() {
+  local v=""
+  if command -v supabase &>/dev/null; then
+    v="$(supabase --version 2>/dev/null | head -1)"
+  elif command -v npx &>/dev/null; then
+    v="$(npx -y supabase --version 2>/dev/null | head -1)"
+  fi
+  # Strip any control chars / quotes so the value is JSON-safe.
+  printf '%s' "${v:-unknown}" | tr -d '\r\n\t"' | tr -dc '[:print:]'
+}
+
+# Read a [section] key from a TOML file (best-effort, no nesting).
+_toml_get() {
+  local file="$1" section="$2" key="$3"
+  [[ -f "$file" ]] || return
+  awk -v sec="[$section]" -v k="$key" '
+    $0 == sec { in_sec=1; next }
+    /^\[/    { in_sec=0 }
+    in_sec && $0 ~ "^[[:space:]]*"k"[[:space:]]*=" {
+      sub(/^[^=]*=[[:space:]]*/, "")
+      gsub(/^[[:space:]"]+|[[:space:]"]+$/, "")
+      print; exit
+    }' "$file"
+}
+
+# Write a MANIFEST.json describing this backup so a restore can know the
+# project_id, ports, host, supabase CLI version, and per-component sha256.
+# Args: $1 = output path, then any number of "label=path" pairs.
+_write_manifest() {
+  local out="$1"; shift
+  local api_port db_port studio_port inbucket_port analytics_port
+  api_port="$(_toml_get "$SUPABASE_CONFIG" api port)"
+  db_port="$(_toml_get "$SUPABASE_CONFIG" db port)"
+  studio_port="$(_toml_get "$SUPABASE_CONFIG" studio port)"
+  inbucket_port="$(_toml_get "$SUPABASE_CONFIG" inbucket port)"
+  analytics_port="$(_toml_get "$SUPABASE_CONFIG" analytics port)"
+  api_port="${api_port:-54321}"; db_port="${db_port:-54322}"
+  studio_port="${studio_port:-54323}"; inbucket_port="${inbucket_port:-54324}"
+  analytics_port="${analytics_port:-54327}"
+
+  {
+    printf '{\n'
+    printf '  "schema_version": 1,\n'
+    printf '  "created_at": "%s",\n' "$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+    printf '  "stamp": "%s",\n' "$STAMP"
+    printf '  "source": {\n'
+    printf '    "host": "%s",\n' "$(hostname -s 2>/dev/null || echo unknown)"
+    printf '    "user": "%s",\n' "${USER:-unknown}"
+    printf '    "os": "%s",\n' "$(uname -s)"
+    printf '    "arch": "%s",\n' "$(uname -m)"
+    printf '    "path": "%s"\n' "$PROJECT_ROOT"
+    printf '  },\n'
+    printf '  "supabase": {\n'
+    printf '    "project_id": "%s",\n' "$PROJECT_ID"
+    printf '    "cli_version": "%s",\n' "$(_supabase_cli_version | sed 's/"/\\"/g')"
+    printf '    "storage_volume": "%s",\n' "$STORAGE_VOLUME"
+    printf '    "db_volume": "%s"\n' "$DB_VOLUME"
+    printf '  },\n'
+    printf '  "ports": {\n'
+    printf '    "supabase_api": %s,\n' "$api_port"
+    printf '    "supabase_db": %s,\n' "$db_port"
+    printf '    "supabase_studio": %s,\n' "$studio_port"
+    printf '    "supabase_inbucket": %s,\n' "$inbucket_port"
+    printf '    "supabase_analytics": %s,\n' "$analytics_port"
+    printf '    "backend": 8000,\n'
+    printf '    "frontend": 5173,\n'
+    printf '    "proxy": 443\n'
+    printf '  },\n'
+    printf '  "components": {\n'
+    local first=1
+    for pair in "$@"; do
+      local label="${pair%%=*}"
+      local path="${pair#*=}"
+      local size=0 hash=""
+      if [[ -f "$path" ]]; then
+        size="$(wc -c < "$path" | tr -d ' ')"
+        hash="$(_sha256 "$path")"
+      fi
+      [[ $first -eq 1 ]] || printf ',\n'
+      first=0
+      printf '    "%s": { "file": "%s", "bytes": %s, "sha256": "%s" }' \
+        "$label" "$(basename "$path")" "$size" "$hash"
+    done
+    printf '\n  }\n'
+    printf '}\n'
+  } > "$out"
+}
 
 # ══════════════════════════════════════════════════════════════════════════════
 # ── INSTALL / RETRY MODE ─────────────────────────────────────────────────────
@@ -347,8 +478,15 @@ if [[ "$INSTALL_MODE" == "true" ]]; then
   # ══════════════════════════════════════════════════════════════════════════
   _head "Phase 1 · Checking Prerequisites"
   _nl
-  _info "Scanning for required tools..."
+  if [[ "$SKIP_PREREQS" == "true" ]]; then
+    _info "${BLD}--skip-prereqs${N} set — skipping detection and installs."
+  fi
+  _info "Scanning for required tools and host state..."
   MISSING=()
+  # Host facts (used by later phases too)
+  HOST_ARCH="$(uname -m)"
+  HOST_OS_VER="$(sw_vers -productVersion 2>/dev/null || uname -r)"
+  _info "Host: ${BLD}$(uname -s) ${HOST_OS_VER} (${HOST_ARCH})${N}"
 
   # Python
   PY_NEEDS_UPGRADE=false
@@ -424,10 +562,109 @@ if [[ "$INSTALL_MODE" == "true" ]]; then
     MISSING+=("mkcert")
   fi
 
+  # mkcert root CA in trust store (only if mkcert is present)
+  if command -v mkcert &>/dev/null; then
+    if security find-certificate -c "mkcert" /Library/Keychains/System.keychain &>/dev/null || \
+       security find-certificate -c "mkcert" ~/Library/Keychains/login.keychain-db &>/dev/null; then
+      _ok "mkcert CA   — ${G}trusted${N}"
+    else
+      _warn "mkcert CA   — ${Y}not yet trusted (will run 'mkcert -install' in Phase 8)${N}"
+    fi
+  fi
+
+  # supabase CLI (preferred over npx for speed)
+  if command -v supabase &>/dev/null; then
+    _ok "supabase    — ${G}$(supabase --version 2>/dev/null | head -1)${N}"
+  else
+    _warn "supabase    — ${Y}not found (will fall back to 'npx -y supabase')${N}"
+    MISSING+=("supabase")
+  fi
+
+  # psql / pg_dump (libpq) — needed for DB dump replay
+  if command -v psql &>/dev/null && command -v pg_dump &>/dev/null; then
+    _ok "psql        — ${G}$(psql --version | awk '{print $NF}')${N}"
+  else
+    _warn "psql        — ${Y}not found (libpq missing)${N}"
+    MISSING+=("libpq")
+  fi
+
+  # jq — needed for MANIFEST.json parsing
+  if command -v jq &>/dev/null; then
+    _ok "jq          — ${G}$(jq --version)${N}"
+  else
+    _warn "jq          — ${Y}not found${N}"
+    MISSING+=("jq")
+  fi
+
+  # ── Host-level checks (informational; do not block install) ────────────────
+  _nl
+  _info "Host state:"
+
+  # Free disk space (need at least 10 GB for code + node_modules + Docker images)
+  FREE_GB="$(df -k "$HOME" | awk 'NR==2 {printf "%d", $4/1024/1024}')"
+  if [[ -n "$FREE_GB" ]] && (( FREE_GB >= 10 )); then
+    _ok "Disk space  — ${G}${FREE_GB} GB free${N} in \$HOME"
+  else
+    _warn "Disk space  — ${Y}${FREE_GB} GB free${N} (recommend ≥10 GB)"
+  fi
+
+  # /etc/hosts entries (informational — Phase 9 will offer to add them)
+  if grep -q 'cloudblue.ai' /etc/hosts 2>/dev/null; then
+    _ok "/etc/hosts  — ${G}cloudblue.ai entries present${N}"
+  else
+    _info "/etc/hosts  — cloudblue.ai entries will be added in Phase 9"
+  fi
+
+  # Port conflicts (look at default ports — Phase 10 will reassign if needed)
+  _busy_ports=()
+  for p in 443 5173 8000 54321 54322 54323; do
+    if lsof -iTCP:"$p" -sTCP:LISTEN &>/dev/null; then
+      _busy_ports+=("$p")
+    fi
+  done
+  if [[ ${#_busy_ports[@]} -eq 0 ]]; then
+    _ok "Default ports — ${G}all free${N}"
+  else
+    _warn "Default ports — ${Y}in use: ${_busy_ports[*]}${N} (Phase 10 will reassign)"
+  fi
+
+  # Existing CB-Next installation at target path
+  if [[ -d "$INSTALL_PATH" && -f "${INSTALL_PATH}/dev.sh" ]]; then
+    _warn "Existing CB-Next install at ${INSTALL_PATH} — Phase 2 will prompt before overwriting"
+  fi
+
+  # Existing Supabase project with same id (would share volumes/ports)
+  if docker volume inspect "supabase_db_${PROJECT_ID:-taylor}" &>/dev/null; then
+    _warn "Supabase project '${PROJECT_ID:-taylor}' already exists on this host — restore will reuse its volumes unless you choose a new project id"
+  fi
+
+  # Honor --prereqs-only: report, then exit without changing anything.
+  if [[ "$PREREQS_ONLY" == "true" ]]; then
+    _nl
+    _info "${BLD}--prereqs-only${N} set — exiting after detection report."
+    if [[ ${#MISSING[@]} -gt 0 ]]; then
+      _warn "${#MISSING[@]} missing prerequisite(s): ${MISSING[*]}"
+      exit 2
+    else
+      _ok "All prerequisites satisfied."
+      exit 0
+    fi
+  fi
+
+  if [[ "$SKIP_PREREQS" == "true" ]]; then
+    MISSING=()  # don't enter the install loop
+  fi
+
   if [[ ${#MISSING[@]} -gt 0 ]]; then
     _nl
     echo -e "  ${R}${BLD}${#MISSING[@]} missing prerequisite(s): ${MISSING[*]}${N}"
     _nl
+    if [[ "$DRY_RUN" == "true" ]]; then
+      _info "${BLD}--dry-run${N}: would install the following and stop:"
+      for pkg in "${MISSING[@]}"; do _dim "  · ${pkg}"; done
+      _info "Re-run without --dry-run to perform the install."
+      exit 0
+    fi
     for pkg in "${MISSING[@]}"; do
       case "$pkg" in
         docker-start)
@@ -566,6 +803,54 @@ if [[ "$INSTALL_MODE" == "true" ]]; then
         npm)
           _warn "npm is required (usually comes with Node.js)."
           _nl ;;
+        supabase)
+          echo -e "  ${C}── Supabase CLI ──${N}"
+          _info "supabase CLI speeds up start/stop vs 'npx -y supabase'."
+          _nl
+          _ask "Install supabase CLI now? [Y/n]: "
+          read -r _sb
+          if [[ "${_sb:-Y}" =~ ^[Yy] ]]; then
+            case "$INST_OS" in
+              macOS) brew install supabase/tap/supabase 2>&1 | tail -3 ;;
+              Linux) _warn "Install manually: https://github.com/supabase/cli#install-the-cli" ;;
+            esac
+            command -v supabase &>/dev/null && _ok "supabase CLI installed" || _warn "supabase CLI not on PATH yet — npx fallback will be used"
+          fi
+          _nl ;;
+        libpq)
+          echo -e "  ${C}── libpq (psql/pg_dump) ──${N}"
+          _info "Needed to replay the database dump on restore."
+          _nl
+          _ask "Install libpq now? [Y/n]: "
+          read -r _lpq
+          if [[ "${_lpq:-Y}" =~ ^[Yy] ]]; then
+            case "$INST_OS" in
+              macOS)
+                brew install libpq 2>&1 | tail -3
+                # libpq is keg-only — add to PATH for the rest of this script.
+                if [[ -d "$(brew --prefix libpq 2>/dev/null)/bin" ]]; then
+                  export PATH="$(brew --prefix libpq)/bin:$PATH"
+                  _info "Added libpq/bin to PATH for this install session"
+                fi ;;
+              Linux) sudo apt-get install -y postgresql-client 2>&1 | tail -3 ;;
+            esac
+            command -v psql &>/dev/null && _ok "psql installed" || _warn "psql not on PATH"
+          fi
+          _nl ;;
+        jq)
+          echo -e "  ${C}── jq ──${N}"
+          _info "Needed to read MANIFEST.json from the backup archive."
+          _nl
+          _ask "Install jq now? [Y/n]: "
+          read -r _jq
+          if [[ "${_jq:-Y}" =~ ^[Yy] ]]; then
+            case "$INST_OS" in
+              macOS) brew install jq 2>&1 | tail -3 ;;
+              Linux) sudo apt-get install -y jq 2>&1 | tail -3 ;;
+            esac
+            command -v jq &>/dev/null && _ok "jq installed" || _warn "jq not on PATH"
+          fi
+          _nl ;;
       esac
     done
   fi
@@ -589,20 +874,56 @@ if [[ "$INSTALL_MODE" == "true" ]]; then
   _info "Found components:"
   SQL_DUMP=""
   STORAGE_ARCHIVE=""
+  REDIS_ARCHIVE=""
   CODE_ARCHIVE=""
+  MANIFEST_PATH=""
   for f in "$EXTRACT_TMP"/*; do
     fname="$(basename "$f")"
     fsize="$(du -sh "$f" | awk '{print $1}')"
     _dim "  ${fname}  [${fsize}]"
     case "$fname" in
+      *-MANIFEST.json)           MANIFEST_PATH="$f" ;;
       *-cbnext.sql)              SQL_DUMP="$f" ;;
       *-cbnext-storage.tar.gz)   STORAGE_ARCHIVE="$f" ;;
+      *-cbnext-redis.tar.gz)     REDIS_ARCHIVE="$f" ;;
       *-cbnext-code.tar.gz)      CODE_ARCHIVE="$f" ;;
       *-cbnext.env)              cp "$f" "${INSTALL_PATH}/.env"; _log "Restored .env" ;;
       *-supabase-config.toml)    mkdir -p "${INSTALL_PATH}/supabase"; cp "$f" "${INSTALL_PATH}/supabase/config.toml"; _log "Restored config.toml" ;;
       *.env.*)                   cp "$f" "${INSTALL_PATH}/$(echo "$fname" | sed 's/^[0-9_-]*-//')"; _log "Restored extra env: $fname" ;;
     esac
   done
+
+  # Read the manifest (if present) — it tells us project_id, ports, and lets us
+  # verify component sha256 before restoring them.
+  RESTORE_PROJECT_ID=""
+  RESTORE_API_PORT=54321
+  RESTORE_DB_PORT=54322
+  if [[ -n "$MANIFEST_PATH" && -f "$MANIFEST_PATH" ]]; then
+    _ok "MANIFEST.json found — reading restore parameters"
+    if command -v jq &>/dev/null; then
+      RESTORE_PROJECT_ID="$(jq -r '.supabase.project_id // empty' "$MANIFEST_PATH")"
+      RESTORE_API_PORT="$(jq -r '.ports.supabase_api // 54321' "$MANIFEST_PATH")"
+      RESTORE_DB_PORT="$(jq -r '.ports.supabase_db // 54322' "$MANIFEST_PATH")"
+      _dim "  project_id: ${RESTORE_PROJECT_ID}, api: ${RESTORE_API_PORT}, db: ${RESTORE_DB_PORT}"
+
+      # Verify component sha256 (best-effort — warn on mismatch, don't abort)
+      while IFS=$'\t' read -r _label _file _sha; do
+        [[ -z "$_file" || -z "$_sha" ]] && continue
+        local_path="${EXTRACT_TMP}/${_file}"
+        [[ -f "$local_path" ]] || continue
+        actual="$(_sha256 "$local_path")"
+        if [[ -n "$actual" && "$actual" != "$_sha" ]]; then
+          _warn "Checksum mismatch for ${_label}: archive may be corrupted"
+        fi
+      done < <(jq -r '.components | to_entries[] | "\(.key)\t\(.value.file)\t\(.value.sha256)"' "$MANIFEST_PATH" 2>/dev/null)
+    else
+      _warn "jq missing — skipping manifest checksum verification"
+    fi
+    # Stash manifest in the install dir so --retry can find it later.
+    cp "$MANIFEST_PATH" "${INSTALL_PATH}/.cbnext-manifest.json"
+  else
+    _warn "No MANIFEST.json in archive — restoring with defaults (older backup)"
+  fi
 
   # Copy SQL dump and storage archive to install path so they survive temp cleanup
   if [[ -n "$SQL_DUMP" && -f "$SQL_DUMP" ]]; then
@@ -614,6 +935,11 @@ if [[ "$INSTALL_MODE" == "true" ]]; then
     cp "$STORAGE_ARCHIVE" "${INSTALL_PATH}/$(basename "$STORAGE_ARCHIVE")"
     STORAGE_ARCHIVE="${INSTALL_PATH}/$(basename "$STORAGE_ARCHIVE")"
     _log "Copied storage archive to install path"
+  fi
+  if [[ -n "$REDIS_ARCHIVE" && -f "$REDIS_ARCHIVE" ]]; then
+    cp "$REDIS_ARCHIVE" "${INSTALL_PATH}/$(basename "$REDIS_ARCHIVE")"
+    REDIS_ARCHIVE="${INSTALL_PATH}/$(basename "$REDIS_ARCHIVE")"
+    _log "Copied redis archive to install path"
   fi
 
   # Extract code archive
@@ -806,6 +1132,42 @@ if [[ "$INSTALL_MODE" == "true" ]]; then
       psql "$_ADMIN_DB_URL" -v ON_ERROR_STOP=0 -f "$SQL_DUMP" >> "$LOG_FILE" 2>&1 || true
       _ok "Storage metadata restored"
 
+      # ── Sanity check: did the public schema actually get populated? ────────
+      # If no tables exist (or they're all empty) the dump replay failed in a
+      # way ON_ERROR_STOP=0 hid. Fall back to migrations + seed.
+      _PUB_TABLES="$(psql "$_RESTORE_DB_URL" -tA -c \
+        "SELECT count(*) FROM pg_tables WHERE schemaname='public'" 2>/dev/null | tr -d '[:space:]')"
+      _PUB_TABLES="${_PUB_TABLES:-0}"
+      if (( _PUB_TABLES < 5 )); then
+        _warn "Dump replay only produced ${_PUB_TABLES} public tables — falling back to migrations + seed"
+        DB_FALLBACK=true
+      else
+        _ok "Public schema has ${_PUB_TABLES} tables"
+        DB_FALLBACK=false
+      fi
+
+      if [[ "${DB_FALLBACK:-false}" == "true" ]]; then
+        _info "Resetting public schema before fallback..."
+        psql "$_RESTORE_DB_URL" -c "
+          DROP SCHEMA IF EXISTS public CASCADE;
+          CREATE SCHEMA public;
+          GRANT ALL ON SCHEMA public TO postgres;
+          GRANT USAGE ON SCHEMA public TO anon, authenticated, service_role;
+          GRANT CREATE ON SCHEMA public TO postgres;
+        " >> "$LOG_FILE" 2>&1
+        if [[ -d "backend" ]]; then
+          _info "Running Alembic migrations..."
+          (cd backend && ../.venv/bin/python -m alembic upgrade head 2>&1 | tail -8) || \
+            _warn "alembic upgrade failed — schema may be partial"
+        fi
+        if [[ -f "supabase/seed.sql" ]]; then
+          _info "Applying supabase/seed.sql..."
+          psql "$_RESTORE_DB_URL" -v ON_ERROR_STOP=0 -f supabase/seed.sql >> "$LOG_FILE" 2>&1 || true
+          _ok "Seed applied"
+        fi
+        _ok "Fallback path complete — schema rebuilt from migrations+seed"
+      fi
+
       DB_RESTORED=true
 
       # Recreate auth users via Supabase Admin API to preserve original UUIDs
@@ -836,6 +1198,8 @@ if [[ "$INSTALL_MODE" == "true" ]]; then
       ' "$SQL_DUMP" 2>/dev/null)"
 
       _AUTH_COUNT=0
+      _AUTH_UIDS=()
+      _AUTH_EMAILS=()
       if [[ -n "$_AUTH_DATA" && -n "$_SB_SVC_KEY" ]]; then
         while IFS=$'\t' read -r _uid _email _meta; do
           [[ -z "$_uid" || -z "$_email" ]] && continue
@@ -849,10 +1213,48 @@ if [[ "$INSTALL_MODE" == "true" ]]; then
           if [[ "$_HTTP" == "200" || "$_HTTP" == "201" ]]; then
             _ok "Auth user: ${_email}"
             _AUTH_COUNT=$((_AUTH_COUNT + 1))
+            _AUTH_UIDS+=("$_uid")
+            _AUTH_EMAILS+=("$_email")
           fi
         done <<< "$_AUTH_DATA"
       fi
       _ok "${_AUTH_COUNT} auth user(s) recreated"
+
+      # ── Demo-password reset ────────────────────────────────────────────────
+      # Restored users have no password (GoTrue won't accept dumped hashes).
+      # Offer to set a single demo password for ALL restored users so the demo
+      # can log in immediately. Off by default — destructive if the original
+      # hashes were ever recoverable.
+      if (( _AUTH_COUNT > 0 )); then
+        _nl
+        _ask "Set a demo password for all ${_AUTH_COUNT} restored users? [y/N]: "
+        read -r _set_pw
+        if [[ "${_set_pw:-N}" =~ ^[Yy] ]]; then
+          _ask "Demo password (min 6 chars): "
+          read -rs _demo_pw
+          echo ""
+          if [[ ${#_demo_pw} -ge 6 ]]; then
+            _info "Applying demo password to ${_AUTH_COUNT} user(s)..."
+            _PW_OK=0
+            for _i in "${!_AUTH_UIDS[@]}"; do
+              _uid="${_AUTH_UIDS[$_i]}"
+              _email="${_AUTH_EMAILS[$_i]}"
+              _HTTP=$(curl -s -o /dev/null -w "%{http_code}" \
+                -X PUT "${_SB_API}/auth/v1/admin/users/${_uid}" \
+                -H "apikey: ${_SB_SVC_KEY}" \
+                -H "Authorization: Bearer ${_SB_SVC_KEY}" \
+                -H "Content-Type: application/json" \
+                -d "{\"password\":\"${_demo_pw}\"}" \
+                2>/dev/null || echo "000")
+              [[ "$_HTTP" == "200" ]] && _PW_OK=$((_PW_OK + 1))
+            done
+            _ok "Demo password set on ${_PW_OK}/${_AUTH_COUNT} user(s)"
+          else
+            _warn "Password too short — skipped"
+          fi
+          unset _demo_pw
+        fi
+      fi
     else
       _info "Running migrations..."
       if [[ -d "backend" && -f ".venv/bin/alembic" ]]; then
@@ -1320,6 +1722,45 @@ if [[ "$INSTALL_MODE" == "true" || "$RETRY_MODE" == "true" ]]; then
   [[ "$HOSTS_OK" == "true" ]] 2>/dev/null                   && _ok "Hosts file        ✓" || _ok "Hosts file        — localhost fallback"
   [[ -f ".env" ]]                                           && _ok ".env              ✓" || _warn ".env              — missing"
   [[ -n "$USER_EMAIL" ]]                                    && _ok "User account      — ${USER_EMAIL}" || _ok "User account      — skipped"
+
+  # ── Live verification — probe the running services ──────────────────────────
+  _nl
+  _info "Live service probes:"
+
+  _SB_API="${SB_URL:-http://127.0.0.1:${RESTORE_API_PORT:-54321}}"
+  _SVC_KEY="$(grep '^SUPABASE_SERVICE_KEY=' .env 2>/dev/null | cut -d= -f2- || echo "")"
+
+  # Supabase API health (returns 401 without apikey — that itself proves it's up)
+  if curl -sf -o /dev/null -m 3 "${_SB_API}/auth/v1/settings" -H "apikey: ${_SVC_KEY}"; then
+    _ok "Supabase API     — responding"
+  elif curl -s -o /dev/null -m 3 "${_SB_API}/" -w '%{http_code}' | grep -qE '^(2|3|4)'; then
+    _ok "Supabase API     — reachable (auth required)"
+  else
+    _warn "Supabase API     — no response at ${_SB_API}"
+  fi
+
+  # Storage buckets visible
+  _BUCKETS_JSON="$(curl -sf -m 3 "${_SB_API}/storage/v1/bucket" \
+    -H "apikey: ${_SVC_KEY}" -H "Authorization: Bearer ${_SVC_KEY}" 2>/dev/null || echo "[]")"
+  _BUCKET_COUNT="$(echo "$_BUCKETS_JSON" | jq -r 'length // 0' 2>/dev/null || echo "0")"
+  if (( _BUCKET_COUNT > 0 )); then
+    _ok "Storage buckets  — ${_BUCKET_COUNT} bucket(s)"
+  else
+    _warn "Storage buckets  — none (was the dump restored?)"
+  fi
+
+  # Public schema row counts — pick a canonical table
+  _DB_URL_PROBE="postgresql://postgres:postgres@127.0.0.1:${RESTORE_DB_PORT:-54322}/postgres"
+  if command -v psql &>/dev/null; then
+    _ROW_COUNT="$(psql "$_DB_URL_PROBE" -tA -c \
+      "SELECT (SELECT count(*) FROM pg_tables WHERE schemaname='public')" 2>/dev/null | tr -d '[:space:]')"
+    if [[ -n "$_ROW_COUNT" && "$_ROW_COUNT" -gt 0 ]]; then
+      _ok "Public schema    — ${_ROW_COUNT} table(s)"
+    else
+      _warn "Public schema    — empty"
+    fi
+  fi
+
   _nl
 
   echo -e "  ${G}${BLD}╔══════════════════════════════════════════════════════════╗${N}"
@@ -1417,6 +1858,236 @@ fi
 # ══════════════════════════════════════════════════════════════════════════════
 
 fi # end outer INSTALL_MODE || RETRY_MODE guard
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ── --test-restore MODE ──────────────────────────────────────────────────────
+# Sandboxed backup → restore loop on the current machine. Uses a different
+# Supabase project_id and shifted ports so the live 'taylor' stack is untouched.
+# ══════════════════════════════════════════════════════════════════════════════
+if [[ "$TEST_RESTORE_MODE" == "true" ]]; then
+  TS="${STAMP}"
+  SANDBOX="/tmp/cbnext-test-${TS}"
+  TEST_PROJECT_ID="${PROJECT_ID}_test"
+  # Shift all ports +1000 so we don't collide with the live stack.
+  T_API_PORT=$((54321 + 1000))      # 55321
+  T_DB_PORT=$((54322 + 1000))       # 55322
+  T_STUDIO_PORT=$((54323 + 1000))   # 55323
+  T_INBUCKET_PORT=$((54324 + 1000)) # 55324
+  T_SHADOW_PORT=$((54320 + 1000))   # 55320
+  T_ANALYTICS_PORT=$((54327 + 1000)) # 55327
+  T_POOLER_PORT=$((54329 + 1000))   # 55329
+
+  echo ""
+  echo "╔══════════════════════════════════════════════════╗"
+  echo "║       CB-Next Backup/Restore Test — sandbox      ║"
+  echo "╚══════════════════════════════════════════════════╝"
+  echo "  Sandbox       : ${SANDBOX}"
+  echo "  Test project  : ${TEST_PROJECT_ID}"
+  echo "  Ports         : api ${T_API_PORT} / db ${T_DB_PORT} / studio ${T_STUDIO_PORT}"
+  echo "  Keep on exit  : ${TEST_KEEP}"
+  echo ""
+
+  # ── Defensive cleanup of any leftover test volumes from a prior crashed run
+  for v in "supabase_db_${TEST_PROJECT_ID}" "supabase_storage_${TEST_PROJECT_ID}" "supabase_config_${TEST_PROJECT_ID}"; do
+    if docker volume inspect "$v" &>/dev/null; then
+      echo "  → removing leftover volume: $v"
+      docker volume rm -f "$v" &>/dev/null || true
+    fi
+  done
+
+  mkdir -p "${SANDBOX}/archive" "${SANDBOX}/restore"
+
+  # ── Get an archive (either user-provided or a fresh backup) ────────────────
+  if [[ -n "$TEST_ARCHIVE" && -f "$TEST_ARCHIVE" ]]; then
+    echo "→ Using existing archive: $TEST_ARCHIVE"
+    cp "$TEST_ARCHIVE" "${SANDBOX}/archive/"
+    ARCHIVE_FILE="${SANDBOX}/archive/$(basename "$TEST_ARCHIVE")"
+  else
+    echo "→ Creating a fresh backup first..."
+    bash "$0" 2>&1 | tail -5
+    ARCHIVE_FILE="$(ls -1t "${SCRIPT_DIR}/cb-next-full_"*.tar.gz 2>/dev/null | head -1)"
+    if [[ -z "$ARCHIVE_FILE" ]]; then
+      echo "✗ No archive produced by backup — aborting"
+      exit 1
+    fi
+    echo "  archive: $ARCHIVE_FILE"
+  fi
+
+  # ── Extract into sandbox ──────────────────────────────────────────────────
+  echo "→ Extracting bundle to ${SANDBOX}/restore/"
+  tar xzf "$ARCHIVE_FILE" -C "${SANDBOX}/restore"
+
+  # Find inner components
+  T_MANIFEST=""; T_SQL=""; T_STORAGE=""; T_REDIS=""; T_CODE=""; T_ENV=""; T_TOML=""
+  for f in "${SANDBOX}/restore"/*; do
+    case "$(basename "$f")" in
+      *-MANIFEST.json)           T_MANIFEST="$f" ;;
+      *-cbnext.sql)              T_SQL="$f" ;;
+      *-cbnext-storage.tar.gz)   T_STORAGE="$f" ;;
+      *-cbnext-redis.tar.gz)     T_REDIS="$f" ;;
+      *-cbnext-code.tar.gz)      T_CODE="$f" ;;
+      *-cbnext.env)              T_ENV="$f" ;;
+      *-supabase-config.toml)    T_TOML="$f" ;;
+    esac
+  done
+  echo "  manifest: $(basename "${T_MANIFEST:-(none)}")"
+  echo "  sql     : $(basename "${T_SQL:-(none)}")"
+  echo "  storage : $(basename "${T_STORAGE:-(none)}")"
+  echo "  code    : $(basename "${T_CODE:-(none)}")"
+
+  # ── Extract code (just so we get supabase/migrations/ + seed.sql for fallback)
+  CODE_DIR="${SANDBOX}/restore/code"
+  mkdir -p "$CODE_DIR"
+  if [[ -n "$T_CODE" ]]; then
+    tar xzf "$T_CODE" -C "$CODE_DIR" --strip-components=1
+  fi
+  # Replace the bundled config.toml with a port-shifted, renamed version
+  if [[ -n "$T_TOML" ]]; then
+    mkdir -p "${CODE_DIR}/supabase"
+    cp "$T_TOML" "${CODE_DIR}/supabase/config.toml"
+  fi
+
+  # ── Rewrite config.toml: project_id + every port ──────────────────────────
+  TOML="${CODE_DIR}/supabase/config.toml"
+  if [[ -f "$TOML" ]]; then
+    sed -i.bak \
+      -e "s/^project_id *= *\".*\"/project_id = \"${TEST_PROJECT_ID}\"/" \
+      -e "s/^port *= *54321/port = ${T_API_PORT}/" \
+      -e "s/^port *= *54322/port = ${T_DB_PORT}/" \
+      -e "s/^port *= *54323/port = ${T_STUDIO_PORT}/" \
+      -e "s/^port *= *54324/port = ${T_INBUCKET_PORT}/" \
+      -e "s/^port *= *54327/port = ${T_ANALYTICS_PORT}/" \
+      -e "s/^port *= *54329/port = ${T_POOLER_PORT}/" \
+      -e "s/^shadow_port *= *54320/shadow_port = ${T_SHADOW_PORT}/" \
+      "$TOML"
+    rm -f "${TOML}.bak"
+    echo "→ Rewrote config.toml → project_id=${TEST_PROJECT_ID}, api=${T_API_PORT}, db=${T_DB_PORT}"
+  fi
+
+  # ── Rewrite .env to point at shifted ports ────────────────────────────────
+  if [[ -n "$T_ENV" ]]; then
+    cp "$T_ENV" "${CODE_DIR}/.env"
+    sed -i.bak \
+      -e "s|http://127.0.0.1:54321|http://127.0.0.1:${T_API_PORT}|g" \
+      -e "s|http://localhost:54321|http://localhost:${T_API_PORT}|g" \
+      -e "s|127.0.0.1:54322|127.0.0.1:${T_DB_PORT}|g" \
+      -e "s|localhost:54322|localhost:${T_DB_PORT}|g" \
+      "${CODE_DIR}/.env"
+    rm -f "${CODE_DIR}/.env.bak"
+    echo "→ Rewrote .env → SUPABASE_URL on ${T_API_PORT}, DATABASE_URL on ${T_DB_PORT}"
+  fi
+
+  # ── Boot the sandbox Supabase stack ───────────────────────────────────────
+  echo "→ Starting sandbox Supabase stack (this can take a minute)..."
+  if ! (cd "$CODE_DIR" && npx -y supabase start 2>&1 | tail -10); then
+    echo "✗ supabase start failed — aborting test"
+    [[ "$TEST_KEEP" == "true" ]] || rm -rf "$SANDBOX"
+    exit 1
+  fi
+  echo "✓ Sandbox Supabase started"
+
+  # Sync JWT keys from the sandbox stack into the sandbox .env so storage
+  # uploads (and our verification probes) actually authenticate.
+  SB_STATUS="$(cd "$CODE_DIR" && npx -y supabase status 2>/dev/null || true)"
+  SB_ANON="$(echo "$SB_STATUS"  | grep -iE 'Publishable|anon' | head -1 | awk -F'│' '{print $3}' | xargs 2>/dev/null || true)"
+  SB_SVC="$(echo "$SB_STATUS"   | grep -iE '^│.*Secret '       | head -1 | awk -F'│' '{print $3}' | xargs 2>/dev/null || true)"
+  if [[ -n "$SB_ANON" ]]; then
+    sed -i.bak "s|^SUPABASE_ANON_KEY=.*|SUPABASE_ANON_KEY=${SB_ANON}|;s|^VITE_SUPABASE_ANON_KEY=.*|VITE_SUPABASE_ANON_KEY=${SB_ANON}|" "${CODE_DIR}/.env"
+  fi
+  if [[ -n "$SB_SVC" ]]; then
+    sed -i.bak "s|^SUPABASE_SERVICE_KEY=.*|SUPABASE_SERVICE_KEY=${SB_SVC}|" "${CODE_DIR}/.env"
+  fi
+  rm -f "${CODE_DIR}/.env.bak"
+
+  T_DB_URL="postgresql://postgres:postgres@127.0.0.1:${T_DB_PORT}/postgres"
+  T_API_URL="http://127.0.0.1:${T_API_PORT}"
+
+  # ── Restore the database into the sandbox ─────────────────────────────────
+  if [[ -n "$T_SQL" ]]; then
+    echo "→ Restoring database into sandbox..."
+    psql "$T_DB_URL" -c "DROP SCHEMA IF EXISTS public CASCADE; CREATE SCHEMA public; GRANT ALL ON SCHEMA public TO postgres; GRANT USAGE ON SCHEMA public TO anon, authenticated, service_role; GRANT CREATE ON SCHEMA public TO postgres;" > /dev/null 2>&1
+    psql "$T_DB_URL" -v ON_ERROR_STOP=0 -f "$T_SQL" > "${SANDBOX}/psql-restore.log" 2>&1 || true
+    PUB_TABLES="$(psql "$T_DB_URL" -tA -c "SELECT count(*) FROM pg_tables WHERE schemaname='public'" 2>/dev/null | tr -d '[:space:]')"
+    echo "  public tables restored: ${PUB_TABLES:-0}"
+  fi
+
+  # ── Restore storage into the sandbox via the API ──────────────────────────
+  if [[ -n "$T_STORAGE" && -n "$SB_SVC" ]]; then
+    echo "→ Restoring storage into sandbox..."
+    STMP="$(mktemp -d)"
+    tar xzf "$T_STORAGE" -C "$STMP" 2>/dev/null || true
+    STR_ROOT="$STMP/stub"; [[ -d "$STMP/stub/stub" ]] && STR_ROOT="$STMP/stub/stub"
+    UPLOADED=0
+    for bdir in "$STR_ROOT"/*/; do
+      [[ -d "$bdir" ]] || continue
+      bucket="$(basename "$bdir")"
+      curl -s -o /dev/null -X POST "${T_API_URL}/storage/v1/bucket" \
+        -H "apikey: ${SB_SVC}" -H "Authorization: Bearer ${SB_SVC}" \
+        -H "Content-Type: application/json" \
+        -d "{\"id\":\"${bucket}\",\"name\":\"${bucket}\",\"public\":true}" 2>/dev/null || true
+      while IFS= read -r fpath; do
+        relpath="${fpath#${bdir}}"; obj_path="${relpath%/*}"
+        curl -s -o /dev/null -X POST "${T_API_URL}/storage/v1/object/${bucket}/${obj_path}" \
+          -H "apikey: ${SB_SVC}" -H "Authorization: Bearer ${SB_SVC}" \
+          -H "x-upsert: true" --data-binary "@${fpath}" 2>/dev/null || true
+        UPLOADED=$((UPLOADED + 1))
+      done < <(find "$bdir" -type f)
+    done
+    rm -rf "$STMP"
+    echo "  uploaded: ${UPLOADED} file(s)"
+  fi
+
+  # ── Verification ───────────────────────────────────────────────────────────
+  echo ""
+  echo "── Verification ──────────────────────────────────────────"
+  PASS=0; FAIL=0
+  _check() {
+    local name="$1"; shift
+    if "$@"; then printf "  ✓ %s\n" "$name"; PASS=$((PASS+1))
+    else          printf "  ✗ %s\n" "$name"; FAIL=$((FAIL+1)); fi
+  }
+  _check "Sandbox Supabase API reachable"     curl -sfo /dev/null -m 3 -H "apikey: ${SB_SVC}" "${T_API_URL}/auth/v1/settings"
+  _check "Sandbox Supabase DB queryable"      bash -c "psql '$T_DB_URL' -tAc 'SELECT 1' >/dev/null 2>&1"
+  _check "Public schema populated"            bash -c "[[ \$(psql '$T_DB_URL' -tAc \"SELECT count(*) FROM pg_tables WHERE schemaname='public'\" | tr -d '[:space:]') -gt 0 ]]"
+  _check "Studio responds"                    curl -sfo /dev/null -m 3 "http://127.0.0.1:${T_STUDIO_PORT}"
+  _check "Storage buckets present"            bash -c "[[ \$(curl -sf -m 3 '${T_API_URL}/storage/v1/bucket' -H 'apikey: ${SB_SVC}' -H 'Authorization: Bearer ${SB_SVC}' | jq -r 'length // 0') -gt 0 ]]"
+  _check "Live 'taylor' stack untouched"      bash -c "docker volume inspect 'supabase_db_${PROJECT_ID}' >/dev/null 2>&1"
+
+  echo ""
+  if (( FAIL == 0 )); then
+    echo "╔══════════════════════════════════════════════════╗"
+    echo "║      ✅  TEST RESTORE: PASS (${PASS}/${PASS} checks)         ║"
+    echo "╚══════════════════════════════════════════════════╝"
+    RC=0
+  else
+    echo "╔══════════════════════════════════════════════════╗"
+    echo "║      ❌  TEST RESTORE: FAIL (${FAIL}/$((PASS+FAIL)) failures)        ║"
+    echo "╚══════════════════════════════════════════════════╝"
+    RC=1
+  fi
+
+  # ── Teardown ───────────────────────────────────────────────────────────────
+  if [[ "$TEST_KEEP" == "true" ]]; then
+    echo ""
+    echo "  --keep set — leaving sandbox in place:"
+    echo "    ${SANDBOX}"
+    echo "  Tear down later with:"
+    echo "    (cd ${CODE_DIR} && npx -y supabase stop)"
+    echo "    docker volume rm -f supabase_db_${TEST_PROJECT_ID} supabase_storage_${TEST_PROJECT_ID}"
+    echo "    rm -rf ${SANDBOX}"
+  else
+    echo ""
+    echo "→ Tearing down sandbox..."
+    (cd "$CODE_DIR" && npx -y supabase stop --no-backup 2>&1 | tail -3) || true
+    for v in "supabase_db_${TEST_PROJECT_ID}" "supabase_storage_${TEST_PROJECT_ID}" "supabase_config_${TEST_PROJECT_ID}"; do
+      docker volume rm -f "$v" &>/dev/null || true
+    done
+    rm -rf "$SANDBOX"
+    echo "✓ Sandbox removed"
+  fi
+  exit $RC
+fi
+
 # ── Interactive component selection (-o mode) ──────────────────────────────────
 # Available components and their labels
 COMPONENT_KEYS=(database config storage code)
@@ -1489,6 +2160,48 @@ echo ""
 echo "  Project root : ${PROJECT_ROOT}"
 echo "  Backup dir   : ${SCRIPT_DIR}"
 echo "  Timestamp    : ${STAMP}"
+echo "  Project ID   : ${PROJECT_ID}"
+echo "  Storage vol  : ${STORAGE_VOLUME}"
+
+# ── Pre-flight checks ────────────────────────────────────────────────────────
+header "0. Pre-flight checks"
+_preflight_ok=true
+
+# pg_dump available and DB reachable (only matters if we're dumping the DB)
+if [[ "$SEL_DATABASE" == "true" ]]; then
+  if ! command -v pg_dump &>/dev/null; then
+    warn "pg_dump not on PATH — install libpq (brew install libpq) and re-try"
+    _preflight_ok=false
+  elif ! psql "$DB_URL" -tA -c 'SELECT 1' &>/dev/null; then
+    warn "Cannot connect to ${DB_URL%/*}/… — is Supabase running? (npx supabase status)"
+    _preflight_ok=false
+  else
+    success "Database reachable"
+  fi
+fi
+
+# Storage volume exists (warn-only — backup will skip if missing)
+if [[ "$SEL_STORAGE" == "true" ]]; then
+  if docker volume inspect "$STORAGE_VOLUME" &>/dev/null; then
+    success "Docker volume ${STORAGE_VOLUME} present"
+  else
+    warn "Docker volume ${STORAGE_VOLUME} not found — storage backup will be skipped"
+  fi
+fi
+
+# Disk space: at least 2 GB free in SCRIPT_DIR
+_free_kb="$(df -k "$SCRIPT_DIR" | awk 'NR==2 {print $4}')"
+if [[ -n "$_free_kb" ]] && (( _free_kb < 2 * 1024 * 1024 )); then
+  warn "Less than 2 GB free in ${SCRIPT_DIR} — backup may fail"
+else
+  success "Disk space OK ($(df -h "$SCRIPT_DIR" | awk 'NR==2 {print $4}') free)"
+fi
+
+if [[ "$_preflight_ok" != "true" ]]; then
+  echo ""
+  warn "Pre-flight checks failed. Fix the issues above and re-run."
+  exit 1
+fi
 
 # ── 1. Database dump ──────────────────────────────────────────────────────────
 if [[ "$SEL_DATABASE" == "true" ]]; then
@@ -1513,6 +2226,14 @@ if [[ "$SEL_DATABASE" == "true" ]]; then
       echo "ALTER TABLE storage.buckets ENABLE TRIGGER ALL;"
       echo "ALTER TABLE storage.objects ENABLE TRIGGER ALL;"
       echo "RESET ROLE;"
+      echo ""
+      echo "-- CB-NEXT: Auth schema row data (identities, mfa_factors)"
+      pg_dump "$DB_URL" \
+        --table=auth.users \
+        --table=auth.identities \
+        --table=auth.mfa_factors \
+        --table=auth.sessions \
+        --data-only --no-owner --no-acl 2>/dev/null || true
     } >> "$DB_TMP"
     ( cd "$SCRIPT_DIR"; tar czf "$(basename "$DB_OUT")" "$(basename "$DB_TMP")" )
     rm -f "$DB_TMP"
@@ -1536,6 +2257,20 @@ if [[ "$SEL_DATABASE" == "true" ]]; then
       echo "ALTER TABLE storage.buckets ENABLE TRIGGER ALL;"
       echo "ALTER TABLE storage.objects ENABLE TRIGGER ALL;"
       echo "RESET ROLE;"
+    } >> "$SQL_FILE"
+    # Append auth rows (identities, mfa_factors, sso state). Users still come back
+    # via the Admin API on restore so the GoTrue invariants hold — but identities
+    # preserve OAuth linking for restored users.
+    info "Appending auth schema data..."
+    {
+      echo ""
+      echo "-- CB-NEXT: Auth schema row data (identities, mfa_factors)"
+      pg_dump "$DB_URL" \
+        --table=auth.users \
+        --table=auth.identities \
+        --table=auth.mfa_factors \
+        --table=auth.sessions \
+        --data-only --no-owner --no-acl 2>/dev/null || true
     } >> "$SQL_FILE"
     SIZE=$(du -sh "$SQL_FILE" | awk '{print $1}')
     success "Database backup complete: $(basename "$SQL_FILE") [${SIZE}]"
@@ -1621,6 +2356,32 @@ else
   info "Skipped (not selected)"
 fi
 
+# ── 3b. Redis snapshot (best-effort — only if volume exists) ─────────────────
+if [[ "$SEL_STORAGE" == "true" ]]; then
+  header "3b. Redis snapshot"
+  if docker volume inspect "$REDIS_VOLUME" &>/dev/null; then
+    if [[ "$OPTIONS_MODE" == "true" ]]; then
+      REDIS_FILE="${SCRIPT_DIR}/cb-next-redis_${STAMP}.tar.gz"
+    else
+      REDIS_FILE="${SCRIPT_DIR}/${STAMP}-cbnext-redis.tar.gz"
+    fi
+    info "Compressing Redis volume → $(basename "$REDIS_FILE")"
+    docker run --rm \
+      -v "${REDIS_VOLUME}:/mnt:ro" \
+      -v "${SCRIPT_DIR}:/backup" \
+      alpine \
+      tar czf "/backup/$(basename "$REDIS_FILE")" -C /mnt . 2>/dev/null || true
+    if [[ -f "$REDIS_FILE" ]]; then
+      REDIS_SIZE=$(du -sh "$REDIS_FILE" | awk '{print $1}')
+      success "Redis snapshot complete: $(basename "$REDIS_FILE") [${REDIS_SIZE}]"
+    else
+      info "Redis snapshot empty or skipped"
+    fi
+  else
+    info "Volume ${REDIS_VOLUME} not present — skipping Redis snapshot"
+  fi
+fi
+
 # ── 4. Source code snapshot ───────────────────────────────────────────────────
 if [[ "$SEL_CODE" == "true" ]]; then
   header "4. Source Code"
@@ -1652,6 +2413,19 @@ else
   header "4. Source Code"
   info "Skipped (not selected)"
 fi
+
+# ── 4b. Manifest ──────────────────────────────────────────────────────────────
+header "4b. Writing MANIFEST.json"
+MANIFEST_FILE="${SCRIPT_DIR}/${STAMP}-MANIFEST.json"
+_manifest_args=()
+[[ -f "${SCRIPT_DIR}/${STAMP}-cbnext.sql" ]]             && _manifest_args+=("database=${SCRIPT_DIR}/${STAMP}-cbnext.sql")
+[[ -f "${SCRIPT_DIR}/${STAMP}-cbnext.env" ]]             && _manifest_args+=("env=${SCRIPT_DIR}/${STAMP}-cbnext.env")
+[[ -f "${SCRIPT_DIR}/${STAMP}-supabase-config.toml" ]]   && _manifest_args+=("supabase_config=${SCRIPT_DIR}/${STAMP}-supabase-config.toml")
+[[ -f "${SCRIPT_DIR}/${STAMP}-cbnext-storage.tar.gz" ]]  && _manifest_args+=("storage=${SCRIPT_DIR}/${STAMP}-cbnext-storage.tar.gz")
+[[ -f "${SCRIPT_DIR}/${STAMP}-cbnext-redis.tar.gz" ]]    && _manifest_args+=("redis=${SCRIPT_DIR}/${STAMP}-cbnext-redis.tar.gz")
+[[ -f "${SCRIPT_DIR}/${STAMP}-cbnext-code.tar.gz" ]]     && _manifest_args+=("code=${SCRIPT_DIR}/${STAMP}-cbnext-code.tar.gz")
+_write_manifest "$MANIFEST_FILE" "${_manifest_args[@]}"
+success "Manifest written: $(basename "$MANIFEST_FILE")"
 
 # ── 5. Bundle (default mode only) ─────────────────────────────────────────────
 BUNDLE_FILE=""
