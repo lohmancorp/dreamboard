@@ -208,6 +208,16 @@ _write_manifest() {
 # ══════════════════════════════════════════════════════════════════════════════
 if [[ "$INSTALL_MODE" == "true" || "$RETRY_MODE" == "true" ]]; then
 
+# ── Ensure a valid CWD ───────────────────────────────────────────────────────
+# Some terminals are started in a directory that gets deleted later (common
+# when this script is run after a `rm -rf` somewhere in the parent path).
+# `brew`, `sudo`, and many subshells refuse to launch from a non-existent
+# cwd. Move to $HOME early so every later subprocess has a sane cwd.
+if ! pwd -P >/dev/null 2>&1; then
+  echo "  ⚠  Current working directory no longer exists — switching to \$HOME"
+fi
+cd "${HOME:-/tmp}" 2>/dev/null || cd /tmp
+
 # ── Detect terminal dark/light mode ──────────────────────────────────────────
 DARK_MODE=true
 if command -v defaults &>/dev/null; then
